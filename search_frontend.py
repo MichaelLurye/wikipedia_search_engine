@@ -8,6 +8,8 @@ import re
 import pickle
 from google.cloud import storage
 from nltk.corpus import stopwords
+import math
+import threading
 ###########
 class MyFlaskApp(Flask):
     def run(self, host=None, port=None, debug=None, **options):
@@ -15,46 +17,72 @@ class MyFlaskApp(Flask):
 app = MyFlaskApp(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 ##########
-bucket_name = 'bucket-316376375'
-file_path = 'body_bm25_dict.pkl'
+import nltk
+nltk.download('stopwords')
 
-# Create a client to interact with Google Cloud Storage
-client = storage.Client()
+bucket_name = 'bucket-316376375' #load page rank
+client = storage.Client(bucket_name)
+blobs = client.list_blobs(bucket_name, prefix='pr')
+for blob in blobs:
+  if blob.name.endswith('csv.gz'):
+    if not os.path.exists('pr.csv.gz'):
+        blob.download_to_filename('pr.csv.gz')
+    df = pd.read_csv("./pr.csv.gz", header=None)
+    df.columns = ['doc_id', 'page_rank'] 
+    df['page_rank'] = df['page_rank'].apply(lambda x: math.log(x) if x > 0 else 0)
+    pr = df['page_rank']
+    pr.index = df['doc_id']
 
-# Get the bucket
-bucket = client.get_bucket(bucket_name)
 
-# Create a blob (object) for the file
-blob = bucket.blob(file_path)
+def download_file(bucket_name, file_path, local_path): #load dictioneries
+    client = storage.Client()
+    bucket = client.get_bucket(bucket_name)
+    blob = bucket.blob(file_path)
+    blob.download_to_filename(local_path)
 
-# Download the pickle file to a local temporary file
-temp_file_path = '/tmp/bm25_dict.pkl'  # You can choose a different local path
-blob.download_to_filename(temp_file_path)
 
-# Load the pickle file
-with open(temp_file_path, 'rb') as f:
-    bm25_consts = pickle.load(f)
-file_path = 'id_title_dict.pickle'
-client = storage.Client()
-# Get the bucket
-bucket = client.get_bucket(bucket_name)
-# Create a blob (object) for the file
-blob = bucket.blob(file_path)
-# Download the pickle file to a local temporary file
-temp_file_path = '/tmp/id_title_dict.pkl'  # You can choose a different local path
-blob.download_to_filename(temp_file_path)
-# Load the pickle file
-with open(temp_file_path, 'rb') as f:
+doc_len_file_path = 'doc_len.pickle'
+id_title_file_path = 'id_title_dict.pickle'
+doc_len_temp_path = '/tmp/doc_len_dict.pkl'
+id_title_temp_path = '/tmp/id_title_dict.pkl'
+
+
+threads = []
+doc_len_thread = threading.Thread(target=download_file, args=(bucket_name, doc_len_file_path, doc_len_temp_path))
+id_title_thread = threading.Thread(target=download_file, args=(bucket_name, id_title_file_path, id_title_temp_path))
+doc_len_thread.start()
+id_title_thread.start()
+
+threads.append(doc_len_thread)
+threads.append(id_title_thread)
+
+for thread in threads:
+    thread.join()
+
+with open(doc_len_temp_path, 'rb') as f:
+    doc_len = pickle.load(f)
+
+with open(id_title_temp_path, 'rb') as f:
     id_title = pickle.load(f)
 
-inverted_body = InvertedIndex()
+inverted_body = InvertedIndex() #load indices
 inverted_title_stem = InvertedIndex()
 inverted_title = InvertedIndex()
 body_index = inverted_body.read_index('postings_gcp','index','bucket-316376375')
 title_index = inverted_title.read_index('title_index','title_index','bucket-316376375')
 inverted_title_stem = inverted_title.read_index('title_index_stem','title_index_stem','bucket-316376375')
 
-def prepquery(query,stem = False):
+tmp = 0 #calculate global data
+N = len(id_title)
+for k in inverted_title_stem.df.keys():
+  tmp += inverted_title_stem.df[k]
+avg_title_len = (tmp/N)
+tmp1 =0
+for k in body_index.df.keys():
+  tmp1 += body_index.df[k]
+avg_body_len = (tmp1/N)
+
+def prepquery(query,stem = False): #remove stopwords and tokenize
   corpus_stopwords = ["category", "references", "also", "external", "links",
                     "may", "first", "see", "history", "people", "one", "two",
                     "part", "thumb", "including", "second", "following",
@@ -66,66 +94,82 @@ def prepquery(query,stem = False):
     query = PorterStemmer().stem(query)
   tokens = [token.group() for token in RE_WORD.finditer(query.lower())]
   terms = [term for term in tokens if term not in (all_stopwords)]
-    # english_stopwords = frozenset(stopwords.words('english'))
-    # tokens = query.lower().split()
-    # res = [i for i in tokens if i not in english_stopwords]
   return terms
-def cossim(d,q):
-  pass
-def get_big_enough_posting(posting,treshold = 10):
-  sorted_posting = sorted(posting,key=lambda x:x[1],reverse=True)
-  res = []
-  lim = 0
-  for i in sorted_posting:
-    if i[1]>= treshold and lim<=100:
-      res.append(i)
-      lim +=1
-    else:
-      return res
-  return res
 
-def search_body_backend(tokens):
+
+
+def search_body_backend(tokens): #for each word in rhe query, get its posting list
   dir = 'postings_gcp'
-  id_list = []
+  id_list = [] #will contain all the doc_ids for all the words
   for word in tokens:
     posting = body_index.read_a_posting_list(dir,word,bucket_name)
-    tmp = get_big_enough_posting(posting)
-    id_list.extend([(i[0],i[1]) for i in tmp])
+    id_list.extend([(i[0],i[1]) for i in posting if i[1]>30]) #only words that apear more than 30 times in the text
   return id_list
 
-def search_title_intersect(tokens):
-  id_list1 = [title_index.read_a_posting_list('.',tokens[0],'bucket-316376375')]
-  id_list2 = [title_index.read_a_posting_list('.',tokens[1],'bucket-316376375')]
-  return (list(set(id_list1) & set(id_list2)))
+def calculate_bm25_title(idf,l,k1,b,f): #returns the bm25 score for the title
+  return(idf*(f*(k1+1))/(f+k1*(1-b+(b*l/avg_title_len))))
 
-def search_title(tokens):
-  dir = 'title_index'
-  id_list = []
-  for word in tokens:
-    posting = title_index.read_a_posting_list('.',word,'bucket-316376375')
-    id_list.extend([i[0] for i in posting])
-  return id_list
 
-def search_title_with_stem(tokens,tokens_stem):
+def search_title_intersect(tokens,log=True): #returns a list of ids and bm25 rankings for each document
+  res = []
+  if len(tokens)== 1:
+    query = PorterStemmer().stem(tokens[0]) #stem rhe query
+    res = []
+    doc_ids = ([i[0] for i in inverted_title_stem.read_a_posting_list('.',query,bucket_name)]) #get candidates
+    idf = math.log((N - len(doc_ids)) / (len(doc_ids) + 0.5) + 1.0) 
+    for id in doc_ids:
+      title_name = id_title[id].split() 
+      if log == True:
+        res.append((id,math.log(calculate_bm25_title(idf,len(title_name),1.5,0.75,1)))) #return the log of the ranking
+      else:
+        res.append((id,calculate_bm25_title(idf,len(title_name),1.5,0.75,1)))
+    # sorted_res = sorted(res, key=lambda x: x[1],reverse=True) 
+    return res
+  
+  elif len(tokens)==2:
+    res = {}
+    token1 = PorterStemmer().stem(tokens[0])
+    token2 = PorterStemmer().stem(tokens[1])
+    doc_ids1 = ([i[0] for i in inverted_title_stem.read_a_posting_list('.',token1,bucket_name)])
+    doc_ids2 = ([i[0] for i in inverted_title_stem.read_a_posting_list('.',token2,bucket_name)])
+    # intersect = [id for id in doc_ids1 if id in doc_ids2]
+    idf1 = math.log((N - len(doc_ids1)) / (len(doc_ids1) + 0.5) + 1.0)
+    idf2 = math.log((N - len(doc_ids2)) / (len(doc_ids2) + 0.5) + 1.0)
+    for doc in doc_ids1:
+      if doc in res.keys(): #id the doc is new create new key with the rank as its value
+        res[doc]+=math.log(calculate_bm25_title(idf1,len(id_title[doc].split()),1.5,0.75,1))
+      else:
+        res[doc]=math.log(calculate_bm25_title(idf1,len(id_title[doc].split()),1.5,0.75,1))
+    for doc in doc_ids2:
+      if doc in res.keys():
+        res[doc]+=math.log(calculate_bm25_title(idf2,len(id_title[doc].split()),1.5,0.75,1))
+      else:
+        res[doc]=math.log(calculate_bm25_title(idf2,len(id_title[doc].split()),1.5,0.75,1))
+    # sorted_res = sorted(res.items(), key=lambda x: x[1],reverse=True)
+    # return sorted_res
+      return res
+
+
+def search_title_with_stem(tokens): #returns set of all the docs that contains at least one word from the query in the title
   res = set()
-  for i,j in zip(tokens,tokens_stem):
-    idlist_1 =inverted_title_stem.read_a_posting_list('.',j,bucket_name)
+  for i in tokens:
+    i = PorterStemmer().stem(i) 
+    idlist_1 =inverted_title_stem.read_a_posting_list('.',i,bucket_name) 
     for k in idlist_1:
       res.add(k[0])
-    # idlist_2 =title_index.read_a_posting_list('.',i,bucket_name)
-
-    # for k in idlist_2:
-    #   res.add(k[0])
   return res
 
-def calculate_bm25(query_terms,document,f):
+def calculate_bm25(query_terms,document,f,k1=1.5,b=0.75,log=True):
     bm25_score = 0.0
-    N = len(bm25_consts)
     for term in query_terms:
-        idf = np.log10(N/(body_index.df[term]))
-        # f=body_index.read_a_posting_list('postings_gcp',document,'bucket-316376375')
-        bm25_score+= idf*(f*1.5/f*bm25_consts[document])
-    return (document, bm25_score)
+        idf = math.log((N - body_index.df[term]) / (body_index.df[term] + 0.5) + 1.0)
+        l=doc_len[document]
+        bm25_score+= (idf*(f*(k1+1))/(f+k1*(1-b+(b*l/avg_body_len))))
+    if log == False:
+      return (document, bm25_score)
+    else:
+      return (document, math.log(bm25_score))
+
 #########
 @app.route("/search")
 def search():
@@ -151,20 +195,52 @@ def search():
       return jsonify(res)
     # BEGIN SOLUTION
     q = prepquery(query)
-    q_s = prepquery(query,stem=True)
-    relevet_docs=search_body_backend(q)
-    relevet_titles = search_title_with_stem(q,q_s)
-    relevent = []
-    for doc in relevet_docs:
-      if doc[0] in relevet_titles:
-        relevent.append(doc)
-    res = []
-    for doc in relevent:
-      rank = calculate_bm25(q,doc[0],doc[1])[1]
-      _title = id_title[doc[0]]
-      res.append((str(doc[0]),_title,rank))
-    sorted_res = sorted(res, key=lambda x: x[2],reverse=True)
-    res = [(i[0], i[1]) for i in sorted_res]
+    res = set()
+    if len(q)==1:
+      ranking = dict(search_title_intersect(q))
+      relevet_docs=search_body_backend(q) 
+      for doc in relevet_docs: #only docs that pass the title filter
+        rank = calculate_bm25(q,doc[0],doc[1],True) #calculate BM25 for body
+        if rank[0] in ranking.keys():
+          ranking[rank[0]] += 0.25*rank[1] #add the BM25 rank 
+        else:
+          ranking[rank[0]] = 0.25*rank[1]
+      for i in ranking.keys():
+        ranking[i]+=2*pr[i] #add the page rank
+      sorted_res = sorted(ranking.items(), key=lambda x: x[1],reverse=True) #order by score
+      res = [(str(i[0]), id_title[i[0]]) for i in sorted_res][:50]
+    
+    
+    elif len(q)==2:
+      ranking = dict(search_title_intersect(q))
+      relevet_docs=search_body_backend(q)
+      for doc in relevet_docs:
+        rank = calculate_bm25(q,doc[0],doc[1],log=True)
+        if rank[0] in ranking.keys():
+          ranking[rank[0]] += 2*rank[1]
+        else:
+          ranking[rank[0]] = 2*rank[1]
+      for i in ranking.keys():
+        ranking[i]+=1.5*pr[i]
+      sorted_res = sorted(ranking.items(), key=lambda x: x[1],reverse=True)
+      res = [(str(i[0]), id_title[i[0]]) for i in sorted_res][:50]
+
+    
+    else:
+      res = {}
+      relevet_titles = search_title_with_stem(q)
+      relevet_docs=search_body_backend(q)
+      for doc in relevet_docs:
+        if(doc[0] in relevet_titles):
+          rank = calculate_bm25(q,doc[0],doc[1])[1]
+          if doc[0] in res.keys():
+            res[doc[0]]+=2.5*rank
+          else:
+            res[doc[0]]=2.5*rank
+      for i in res.keys():
+        res[i]+=0.5*pr[i]
+      sorted_res = sorted(res.items(), key=lambda x: x[1],reverse=True)
+      res = [(str(i[0]),id_title[i[0]]) for i in sorted_res][:50]
     # END SOLUTION
     return jsonify(res)
 
@@ -308,4 +384,4 @@ def get_pageview():
 
 if __name__ == '__main__':
     # run the Flask RESTful API, make the server publicly available (host='0.0.0.0') on port 8080
-    app.run(host='0.0.0.0', port=8080, debug=True)
+    app.run(host='0.0.0.0', port=8080, debug=True ,use_reloader=False)
